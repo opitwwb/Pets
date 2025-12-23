@@ -1,0 +1,441 @@
+// src/app/api/products/route.ts
+import { NextRequest, NextResponse } from 'next/server'
+import { createServerClient } from '@/lib/supabase/server'
+
+export async function GET(request: NextRequest) {
+  try {
+    const supabase = createServerClient()
+    const { searchParams } = new URL(request.url)
+    
+    const category = searchParams.get('category')
+    const limit = parseInt(searchParams.get('limit') || '20')
+    const offset = parseInt(searchParams.get('offset') || '0')
+
+    let query = supabase
+      .from('products')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+
+    if (category) {
+      query = query.eq('category', category)
+    }
+
+    const { data, error } = await query
+
+    if (error) throw error
+
+    return NextResponse.json({ products: data })
+  } catch (error) {
+    console.error('Error fetching products:', error)
+    return NextResponse.json(
+      { error: 'Failed to fetch products' },
+      { status: 500 }
+    )
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const supabase = createServerClient()
+    const body = await request.json()
+
+    // Verificar autenticação do admin
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const { data, error } = await supabase
+      .from('products')
+      .insert([body])
+      .select()
+      .single()
+
+    if (error) throw error
+
+    // Inicializar histórico de preço
+    if (body.current_price) {
+      await supabase.from('price_history').insert([
+        {
+          product_id: data.id,
+          price: body.current_price
+        }
+      ])
+    }
+
+    return NextResponse.json({ product: data })
+  } catch (error) {
+    console.error('Error creating product:', error)
+    return NextResponse.json(
+      { error: 'Failed to create product' },
+      { status: 500 }
+    )
+  }
+}
+
+// src/app/api/products/[id]/route.ts
+import { NextRequest, NextResponse } from 'next/server'
+import { createServerClient } from '@/lib/supabase/server'
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  try {
+    const supabase = createServerClient()
+
+    const { data: product, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', params.id)
+      .single()
+
+    if (error) throw error
+
+    // Buscar histórico de preços
+    const { data: history } = await supabase
+      .from('price_history')
+      .select('*')
+      .eq('product_id', params.id)
+      .order('recorded_at', { ascending: true })
+
+    return NextResponse.json({
+      product,
+      price_history: history || []
+    })
+  } catch (error) {
+    console.error('Error fetching product:', error)
+    return NextResponse.json(
+      { error: 'Failed to fetch product' },
+      { status: 500 }
+    )
+  }
+}
+
+// src/app/api/alerts/route.ts
+import { NextRequest, NextResponse } from 'next/server'
+import { createServerClient } from '@/lib/supabase/server'
+
+export async function GET(request: NextRequest) {
+  try {
+    const supabase = createServerClient()
+    const { data: { user } } = await supabase.auth.getUser()
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const { data, error } = await supabase
+      .from('price_alerts')
+      .select(`
+        *,
+        product:products(*)
+      `)
+      .eq('user_id', user.id)
+      .eq('is_active', true)
+
+    if (error) throw error
+
+    return NextResponse.json({ alerts: data })
+  } catch (error) {
+    console.error('Error fetching alerts:', error)
+    return NextResponse.json(
+      { error: 'Failed to fetch alerts' },
+      { status: 500 }
+    )
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const supabase = createServerClient()
+    const { data: { user } } = await supabase.auth.getUser()
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const body = await request.json()
+
+    const { data, error } = await supabase
+      .from('price_alerts')
+      .insert([
+        {
+          user_id: user.id,
+          product_id: body.product_id,
+          target_price: body.target_price
+        }
+      ])
+      .select()
+      .single()
+
+    if (error) throw error
+
+    return NextResponse.json({ alert: data })
+  } catch (error) {
+    console.error('Error creating alert:', error)
+    return NextResponse.json(
+      { error: 'Failed to create alert' },
+      { status: 500 }
+    )
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const supabase = createServerClient()
+    const { data: { user } } = await supabase.auth.getUser()
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const { searchParams } = new URL(request.url)
+    const alertId = searchParams.get('id')
+
+    if (!alertId) {
+      return NextResponse.json({ error: 'Alert ID required' }, { status: 400 })
+    }
+
+    const { error } = await supabase
+      .from('price_alerts')
+      .update({ is_active: false })
+      .eq('id', alertId)
+      .eq('user_id', user.id)
+
+    if (error) throw error
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error('Error deleting alert:', error)
+    return NextResponse.json(
+      { error: 'Failed to delete alert' },
+      { status: 500 }
+    )
+  }
+}
+
+// src/app/api/cron/check-prices/route.ts
+import { NextResponse } from 'next/server'
+import { createServerClient } from '@/lib/supabase/server'
+import { scrapeAmazonPrice } from '@/lib/amazon/scraper'
+import { sendPriceAlert } from '@/lib/email/alerts'
+
+export async function GET(request: Request) {
+  // Verificar se a requisição vem do Vercel Cron
+  const authHeader = request.headers.get('authorization')
+  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  try {
+    const supabase = createServerClient()
+
+    // Buscar todos os produtos ativos
+    const { data: products } = await supabase
+      .from('products')
+      .select('*')
+
+    if (!products) {
+      return NextResponse.json({ error: 'No products found' })
+    }
+
+    const results = []
+
+    for (const product of products) {
+      try {
+        // Fazer scraping do preço atual
+        const currentPrice = await scrapeAmazonPrice(product.asin)
+
+        if (!currentPrice) continue
+
+        // Atualizar preço do produto
+        await supabase
+          .from('products')
+          .update({ 
+            current_price: currentPrice,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', product.id)
+
+        // Adicionar ao histórico
+        await supabase
+          .from('price_history')
+          .insert([
+            {
+              product_id: product.id,
+              price: currentPrice
+            }
+          ])
+
+        // Verificar alertas ativos
+        const { data: alerts } = await supabase
+          .from('price_alerts')
+          .select(`
+            *,
+            user:auth.users(email)
+          `)
+          .eq('product_id', product.id)
+          .eq('is_active', true)
+          .lte('target_price', currentPrice)
+
+        // Enviar emails para alertas ativados
+        if (alerts && alerts.length > 0) {
+          for (const alert of alerts) {
+            await sendPriceAlert({
+              email: alert.user.email,
+              productTitle: product.title,
+              currentPrice,
+              targetPrice: alert.target_price,
+              productUrl: product.affiliate_link
+            })
+
+            // Desativar alerta
+            await supabase
+              .from('price_alerts')
+              .update({ is_active: false })
+              .eq('id', alert.id)
+          }
+        }
+
+        results.push({
+          product_id: product.id,
+          price: currentPrice,
+          alerts_sent: alerts?.length || 0
+        })
+
+      } catch (error) {
+        console.error(`Error processing product ${product.id}:`, error)
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      processed: results.length,
+      results
+    })
+
+  } catch (error) {
+    console.error('Error in price check cron:', error)
+    return NextResponse.json(
+      { error: 'Failed to check prices' },
+      { status: 500 }
+    )
+  }
+}
+
+// src/lib/amazon/scraper.ts
+import axios from 'axios'
+import * as cheerio from 'cheerio'
+
+export async function scrapeAmazonPrice(asin: string): Promise<number | null> {
+  try {
+    const url = `https://www.amazon.com.br/dp/${asin}`
+    
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    })
+
+    const $ = cheerio.load(response.data)
+    
+    // Tentar diferentes seletores de preço
+    const priceSelectors = [
+      '.a-price .a-offscreen',
+      '#priceblock_ourprice',
+      '#priceblock_dealprice',
+      '.a-price-whole'
+    ]
+
+    for (const selector of priceSelectors) {
+      const priceText = $(selector).first().text().trim()
+      if (priceText) {
+        // Converter texto para número
+        const price = parseFloat(
+          priceText.replace('R$', '').replace('.', '').replace(',', '.')
+        )
+        if (!isNaN(price)) {
+          return price
+        }
+      }
+    }
+
+    return null
+  } catch (error) {
+    console.error('Error scraping Amazon price:', error)
+    return null
+  }
+}
+
+// src/lib/email/alerts.ts
+interface PriceAlertParams {
+  email: string
+  productTitle: string
+  currentPrice: number
+  targetPrice: number
+  productUrl: string
+}
+
+export async function sendPriceAlert(params: PriceAlertParams) {
+  // Implementar com Resend ou SendGrid
+  // Exemplo com fetch para qualquer provedor de email
+  
+  try {
+    const emailHtml = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; }
+            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+            .header { background: linear-gradient(to right, #f97316, #ea580c); color: white; padding: 20px; border-radius: 10px; }
+            .content { background: #f9fafb; padding: 20px; margin: 20px 0; border-radius: 10px; }
+            .price { font-size: 32px; font-weight: bold; color: #16a34a; }
+            .button { background: #f97316; color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; display: inline-block; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>🎉 Alerta de Preço Ativado!</h1>
+            </div>
+            <div class="content">
+              <h2>${params.productTitle}</h2>
+              <p>O preço caiu para o valor que você definiu!</p>
+              <div class="price">R$ ${params.currentPrice.toFixed(2)}</div>
+              <p>Meta definida: R$ ${params.targetPrice.toFixed(2)}</p>
+              <p style="margin-top: 30px;">
+                <a href="${params.productUrl}" class="button">Ver Produto na Amazon</a>
+              </p>
+            </div>
+            <p style="text-align: center; color: #6b7280; font-size: 12px;">
+              Opitweb - Rastreador de Preços da Amazon
+            </p>
+          </div>
+        </body>
+      </html>
+    `
+
+    // Exemplo com Resend
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: 'OpitWeb <alertas@opitweb.com.br>',
+        to: params.email,
+        subject: `🔔 Preço caiu! ${params.productTitle}`,
+        html: emailHtml
+      })
+    })
+
+    return true
+  } catch (error) {
+    console.error('Error sending price alert email:', error)
+    return false
+  }
+}
